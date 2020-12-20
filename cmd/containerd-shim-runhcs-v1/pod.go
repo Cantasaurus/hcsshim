@@ -80,10 +80,15 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 			sid)
 	}
 
+	p := pod{
+		events: events,
+		id:     req.ID,
+	}
+
+	var parent *uvm.UtilityVM
 	owner := filepath.Base(os.Args[0])
 	isWCOW := oci.IsWCOW(s)
 
-	var parent *uvm.UtilityVM
 	if oci.IsIsolated(s) {
 		// Create the UVM parent
 		opts, err := oci.SpecToUVMCreateOpts(ctx, s, fmt.Sprintf("%s@vm", req.ID), owner)
@@ -127,7 +132,29 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		}
 	} else if !isWCOW {
 		return nil, errors.Wrap(errdefs.ErrFailedPrecondition, "oci spec does not contain WCOW or LCOW spec")
+	} else if oci.IsJobContainer(s) {
+		// If privileged was specified just fake a task (i.e reuse the wcowPodSandbox logic)
+		p.sandboxTask = newWcowPodSandboxTask(ctx, events, req.ID, req.Bundle, parent, "")
+		events.publishEvent(
+			ctx,
+			runtime.TaskCreateEventTopic,
+			&eventstypes.TaskCreate{
+				ContainerID: req.ID,
+				Bundle:      req.Bundle,
+				Rootfs:      req.Rootfs,
+				IO: &eventstypes.TaskIO{
+					Stdin:    req.Stdin,
+					Stdout:   req.Stdout,
+					Stderr:   req.Stderr,
+					Terminal: req.Terminal,
+				},
+				Checkpoint: "",
+				Pid:        0,
+			})
+		p.jobContainer = true
+		return &p, nil
 	}
+
 	defer func() {
 		// clean up the uvm if we fail any further operations
 		if err != nil && parent != nil {
@@ -135,12 +162,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		}
 	}()
 
-	p := pod{
-		events: events,
-		id:     req.ID,
-		host:   parent,
-	}
-
+	p.host = parent
 	if parent != nil {
 		cid := req.ID
 		if id, ok := s.Annotations[oci.AnnotationNcproxyContainerID]; ok {
@@ -201,7 +223,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		}
 		// LCOW (and WCOW Process Isolated for the time being) requires a real
 		// task for the sandbox.
-		lt, err := newHcsTask(ctx, events, parent, true, req, s)
+		lt, err := newHcsTask(ctx, events, parent, true, req, p.jobContainer, s)
 		if err != nil {
 			return nil, err
 		}
@@ -230,7 +252,12 @@ type pod struct {
 	// It MUST be treated as read only in the lifetime of the pod.
 	host *uvm.UtilityVM
 
-	// wcl is the workload create mutex. All calls to CreateTask must hold this
+	// jobContainer specifies whether this pod is for WCOW job containers only.
+	//
+	// It MUST be treated as read only in the lifetime of the pod.
+	jobContainer bool
+
+	// wcl is the worload create mutex. All calls to CreateTask must hold this
 	// lock while the ID reservation takes place. Once the ID is held it is safe
 	// to release the lock to allow concurrent creates.
 	wcl           sync.Mutex
@@ -272,6 +299,17 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 		}
 	}()
 
+	if p.jobContainer {
+		// This is a short circuit to make sure that all containers in a pod will have
+		// the same IP address/be added to the same compartment.
+		//
+		// There will need to be OS work needed to support this scenario, so for now we need to block on
+		// this.
+		if !oci.IsJobContainer(s) {
+			return nil, errors.New("cannot create a normal process isolated container if the pod sandbox is a job container")
+		}
+	}
+
 	ct, sid, err := oci.GetSandboxTypeAndID(s.Annotations)
 	if err != nil {
 		return nil, err
@@ -302,7 +340,7 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 	if templateID != "" {
 		st, err = newClonedHcsTask(ctx, p.events, p.host, false, req, s, templateID)
 	} else {
-		st, err = newHcsTask(ctx, p.events, p.host, false, req, s)
+		st, err = newHcsTask(ctx, p.events, p.host, false, req, p.jobContainer, s)
 	}
 	if err != nil {
 		return nil, err

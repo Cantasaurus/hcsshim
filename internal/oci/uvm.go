@@ -526,5 +526,9 @@ func UpdateSpecFromOptions(s specs.Spec, opts *runhcsopts.Options) specs.Spec {
 		s.Annotations[annotationNetworkConfigProxy] = opts.NCProxyAddr
 	}
 
+	if _, ok := s.Annotations[AnnotationHostProcessContainer]; !ok && opts.JobContainer {
+		s.Annotations[AnnotationHostProcessContainer] = "true"
+	}
+
 	return s
 }
